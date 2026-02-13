@@ -34,6 +34,8 @@ struct ContentView: View {
     @AppStorage("itemHeight") private var itemHeight: Double = 450
     @AppStorage("cardSpacing") private var cardSpacing: Double = 220
     @AppStorage("staggerDelay") private var staggerDelay: Double = 0.05
+    @AppStorage("cardCornerRadius") private var cardCornerRadius: Double = 24
+    @AppStorage("minScale") private var minScale: Double = 0.82
     
     // UI Visibility
     @State private var isUIVisible = true
@@ -70,10 +72,12 @@ struct ContentView: View {
                     itemWidth: itemWidth,
                     itemHeight: itemHeight,
                     cardSpacing: cardSpacing,
-                    staggerDelay: staggerDelay,
-                    interval: autoScrollInterval,
-                    isAutoScrollEnabled: isAutoScrollEnabled
-                )
+                        staggerDelay: staggerDelay,
+                        interval: autoScrollInterval,
+                        isAutoScrollEnabled: isAutoScrollEnabled,
+                        cornerRadius: cardCornerRadius,
+                        minScale: minScale
+                    )
                 .ignoresSafeArea()
                 .overlay(
                     VStack(spacing: 0) {
@@ -101,7 +105,9 @@ struct ContentView: View {
                             itemWidth: $itemWidth,
                             itemHeight: $itemHeight,
                             cardSpacing: $cardSpacing,
-                            staggerDelay: $staggerDelay
+                            staggerDelay: $staggerDelay,
+                            cornerRadius: $cardCornerRadius,
+                            minScale: $minScale
                         )
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                     }
@@ -481,6 +487,8 @@ struct OptimizedCarouselView: View {
     let staggerDelay: Double
     let interval: Double
     let isAutoScrollEnabled: Bool
+    let cornerRadius: Double
+    let minScale: Double
     
     // We use a "virtual" index that grows to keep ForEach identities stable.
     @State private var currentIndex: Int = 0
@@ -488,8 +496,9 @@ struct OptimizedCarouselView: View {
     @State private var itemPositionShifts: [Int: CGFloat] = [:]
     @State private var timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
     
-    private let minScale: CGFloat = 0.82
-    private let scaleDropPerStep: CGFloat = 0.1
+    private var scaleDropPerStep: CGFloat {
+        (1.0 - CGFloat(minScale)) / 2.0
+    }
     
     var body: some View {
         GeometryReader { geo in
@@ -503,6 +512,7 @@ struct OptimizedCarouselView: View {
                         item: mediaItems[wrapped],
                         width: geo.size.width,
                         height: geo.size.height,
+                        cornerRadius: cornerRadius,
                         opacity: 0.2,
                         scale: 1.0,
                         isBackground: true
@@ -535,6 +545,7 @@ struct OptimizedCarouselView: View {
                             item: item,
                             width: itemWidth,
                             height: itemHeight,
+                            cornerRadius: cornerRadius,
                             opacity: opacity,
                             scale: scale
                         )
@@ -570,7 +581,7 @@ struct OptimizedCarouselView: View {
     }
     
     private func scaleForPosition(_ distance: CGFloat) -> Double {
-        let scale = max(minScale, 1.0 - (distance * scaleDropPerStep))
+        let scale = max(CGFloat(minScale), 1.0 - (distance * scaleDropPerStep))
         return Double(scale)
     }
     
@@ -582,16 +593,18 @@ struct OptimizedCarouselView: View {
     }
     
     private func integratedScale(fromZeroTo distance: CGFloat) -> CGFloat {
-        guard distance > 0 else { return 0 }
+        let drop = scaleDropPerStep
+        guard distance > 0, drop > 0 else { return distance }
         
-        let linearLimit = (1.0 - minScale) / scaleDropPerStep
+        let mScale = CGFloat(minScale)
+        let linearLimit = (1.0 - mScale) / drop
         if distance <= linearLimit {
-            return distance - (scaleDropPerStep * distance * distance / 2.0)
+            return distance - (drop * distance * distance / 2.0)
         }
         
-        let linearArea = linearLimit - (scaleDropPerStep * linearLimit * linearLimit / 2.0)
+        let linearArea = linearLimit - (drop * linearLimit * linearLimit / 2.0)
         let tailDistance = distance - linearLimit
-        return linearArea + minScale * tailDistance
+        return linearArea + mScale * tailDistance
     }
     
     private func performStep(drift: Int) {
@@ -607,12 +620,12 @@ struct OptimizedCarouselView: View {
             let relativeIndex = virtualIndex - currentIndex
             let delay = max(0, Double(relativeIndex + 2) * staggerDelay)
             
-            withAnimation(.interpolatingSpring(stiffness: 300, damping: 32).delay(delay)) {
+            withAnimation(.easeInOut(duration: 0.6).delay(delay)) {
                 itemPositionShifts[virtualIndex] = -CGFloat(drift)
             }
         }
         
-        let totalTime = maxDelay + 0.7
+        let totalTime = maxDelay + 0.85
         
         DispatchQueue.main.asyncAfter(deadline: .now() + totalTime) {
             currentIndex = currentIndex + drift
@@ -633,6 +646,7 @@ struct CarouselCard: View {
     let item: MediaItem
     let width: Double
     let height: Double
+    let cornerRadius: Double
     let opacity: Double
     let scale: Double
     var isBackground: Bool = false
@@ -652,7 +666,7 @@ struct CarouselCard: View {
             }
         }
         .frame(width: width, height: height)
-        .clipShape(isBackground ? AnyShape(Rectangle()) : AnyShape(RoundedRectangle(cornerRadius: 24, style: .continuous)))
+        .clipShape(isBackground ? AnyShape(Rectangle()) : AnyShape(RoundedRectangle(cornerRadius: CGFloat(cornerRadius), style: .continuous)))
         .scaleEffect(scale)
         .overlay(
             Group {
@@ -714,6 +728,8 @@ struct CarouselControls: View {
     @Binding var itemHeight: Double
     @Binding var cardSpacing: Double
     @Binding var staggerDelay: Double
+    @Binding var cornerRadius: Double
+    @Binding var minScale: Double
     
     @State private var isExpanded: Bool = true
     
@@ -754,6 +770,8 @@ struct CarouselControls: View {
                     ControlSlider(label: "Height", value: $itemHeight, range: 300...1000)
                     ControlSlider(label: "Gap", value: $cardSpacing, range: 10...500)
                     ControlSlider(label: "Stagger", value: $staggerDelay, range: 0...0.2)
+                    ControlSlider(label: "Corners", value: $cornerRadius, range: 0...100)
+                    ControlSlider(label: "Scale", value: $minScale, range: 0.01...1.0)
                 }
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: -10)),
@@ -788,6 +806,10 @@ struct ControlSlider: View {
                         .foregroundColor(.primary)
                 } else if label == "Stagger" {
                     Text(String(format: "%.2fs", value))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.primary)
+                } else if label == "Scale" {
+                    Text(String(format: "%.2f", value))
                         .font(.system(size: 9, design: .monospaced))
                         .foregroundColor(.primary)
                 } else {
