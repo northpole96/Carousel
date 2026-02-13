@@ -28,11 +28,17 @@ struct ContentView: View {
     @State private var albumAlertMessage = ""
     
     // Viewer Settings (HUD)
-    @State private var autoScrollInterval: Double = 3.0
-    @State private var isAutoScrollEnabled: Bool = true
-    @State private var itemWidth: Double = 600
-    @State private var itemHeight: Double = 450
-    @State private var cardSpacing: Double = 220
+    @AppStorage("autoScrollInterval") private var autoScrollInterval: Double = 3.0
+    @AppStorage("isAutoScrollEnabled") private var isAutoScrollEnabled: Bool = true
+    @AppStorage("itemWidth") private var itemWidth: Double = 600
+    @AppStorage("itemHeight") private var itemHeight: Double = 450
+    @AppStorage("cardSpacing") private var cardSpacing: Double = 220
+    @AppStorage("staggerDelay") private var staggerDelay: Double = 0.05
+    
+    // UI Visibility
+    @State private var isUIVisible = true
+    @State private var isCursorHidden = false
+    @State private var hoverTask: Task<Void, Never>?
     
     @AppStorage("savedAlbumIdentifier") private var savedAlbumIdentifier: String = ""
     @AppStorage("savedAlbumTitle") private var savedAlbumTitle: String = ""
@@ -59,33 +65,53 @@ struct ContentView: View {
                     loadSavedAlbum: loadSavedAlbumIfAvailable
                 )
             } else {
-                VStack(spacing: 0) {
-                    CarouselHeader(count: mediaItems.count, onBack: {
-                        withAnimation(.spring()) {
-                            mediaItems = []
-                            selectedItems = []
-                        }
-                    })
-                    
-                    OptimizedCarouselView(
-                        mediaItems: mediaItems,
-                        itemWidth: itemWidth,
-                        itemHeight: itemHeight,
-                        cardSpacing: cardSpacing,
-                        interval: autoScrollInterval,
-                        isAutoScrollEnabled: isAutoScrollEnabled
-                    )
-                    .ignoresSafeArea()
-                }
-                .transition(.opacity)
-                
-                CarouselControls(
-                    autoScrollInterval: $autoScrollInterval,
-                    isAutoScrollEnabled: $isAutoScrollEnabled,
-                    itemWidth: $itemWidth,
-                    itemHeight: $itemHeight,
-                    cardSpacing: $cardSpacing
+                OptimizedCarouselView(
+                    mediaItems: mediaItems,
+                    itemWidth: itemWidth,
+                    itemHeight: itemHeight,
+                    cardSpacing: cardSpacing,
+                    staggerDelay: staggerDelay,
+                    interval: autoScrollInterval,
+                    isAutoScrollEnabled: isAutoScrollEnabled
                 )
+                .ignoresSafeArea()
+                .overlay(
+                    VStack(spacing: 0) {
+                        if isUIVisible {
+                            CarouselHeader(count: mediaItems.count, onBack: {
+                                withAnimation(.spring()) {
+                                    mediaItems = []
+                                    selectedItems = []
+                                    if isCursorHidden {
+                                        NSCursor.unhide()
+                                        isCursorHidden = false
+                                    }
+                                }
+                            })
+                            .transition(.move(edge: .top).combined(with: .opacity))
+                        }
+                        Spacer()
+                    }
+                )
+                .overlay(alignment: .bottomLeading) {
+                    if isUIVisible {
+                        CarouselControls(
+                            autoScrollInterval: $autoScrollInterval,
+                            isAutoScrollEnabled: $isAutoScrollEnabled,
+                            itemWidth: $itemWidth,
+                            itemHeight: $itemHeight,
+                            cardSpacing: $cardSpacing,
+                            staggerDelay: $staggerDelay
+                        )
+                        .transition(.move(edge: .bottom).combined(with: .opacity))
+                    }
+                }
+                .onContinuousHover { _ in
+                    showUI()
+                }
+                .onTapGesture {
+                    showUI()
+                }
             }
             
             if isLoading {
@@ -278,6 +304,31 @@ struct ContentView: View {
             NSWorkspace.shared.open(settingsURL)
         }
     }
+    
+    private func showUI() {
+        if isCursorHidden {
+            NSCursor.unhide()
+            isCursorHidden = false
+        }
+        
+        withAnimation(.spring(response: 0.3, dampingFraction: 0.8)) {
+            isUIVisible = true
+        }
+        
+        hoverTask?.cancel()
+        hoverTask = Task {
+            try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+            if !Task.isCancelled {
+                withAnimation(.easeInOut(duration: 1.0)) {
+                    isUIVisible = false
+                }
+                if !isCursorHidden {
+                    NSCursor.hide()
+                    isCursorHidden = true
+                }
+            }
+        }
+    }
 }
 
 // MARK: - Components
@@ -427,14 +478,18 @@ struct OptimizedCarouselView: View {
     let itemWidth: Double
     let itemHeight: Double
     let cardSpacing: Double
+    let staggerDelay: Double
     let interval: Double
     let isAutoScrollEnabled: Bool
     
     // We use a "virtual" index that grows to keep ForEach identities stable.
     @State private var currentIndex: Int = 0
     @State private var isAnimatingStep: Bool = false
-    @State private var animatedShift: CGFloat = 0
+    @State private var itemPositionShifts: [Int: CGFloat] = [:]
     @State private var timer = Timer.publish(every: 3, on: .main, in: .common).autoconnect()
+    
+    private let minScale: CGFloat = 0.82
+    private let scaleDropPerStep: CGFloat = 0.1
     
     var body: some View {
         GeometryReader { geo in
@@ -467,10 +522,13 @@ struct OptimizedCarouselView: View {
                         let item = mediaItems[wrappedIndex(virtualIndex)]
                         
                         let offsetFromCenter = CGFloat(virtualIndex - currentIndex)
-                        let visualOffset = offsetFromCenter * step + animatedShift
-                        let distance = abs(visualOffset / step)
+                        let shift = itemPositionShifts[virtualIndex] ?? 0
+                        let position = offsetFromCenter + shift
                         
-                        let scale = max(0.82, 1.0 - (distance * 0.1))
+                        let visualOffset = laneOffset(for: position)
+                        let distance = abs(position)
+                        
+                        let scale = scaleForPosition(distance)
                         let opacity = max(0, min(1.0, 1.2 - (distance * 0.4)))
 
                         CarouselCard(
@@ -508,24 +566,64 @@ struct OptimizedCarouselView: View {
     
     private func resetTimer(_ newInterval: Double) {
         timer.upstream.connect().cancel()
-        timer = Timer.publish(every: max(0.5, newInterval), on: .main, in: .common).autoconnect()
+        timer = Timer.publish(every: max(0.1, newInterval), on: .main, in: .common).autoconnect()
+    }
+    
+    private func scaleForPosition(_ distance: CGFloat) -> Double {
+        let scale = max(minScale, 1.0 - (distance * scaleDropPerStep))
+        return Double(scale)
+    }
+    
+    private func laneOffset(for position: CGFloat) -> CGFloat {
+        let sign: CGFloat = position < 0 ? -1 : 1
+        let distance = abs(position)
+        let integral = integratedScale(fromZeroTo: distance)
+        return sign * (CGFloat(cardSpacing) * distance + CGFloat(itemWidth) * integral)
+    }
+    
+    private func integratedScale(fromZeroTo distance: CGFloat) -> CGFloat {
+        guard distance > 0 else { return 0 }
+        
+        let linearLimit = (1.0 - minScale) / scaleDropPerStep
+        if distance <= linearLimit {
+            return distance - (scaleDropPerStep * distance * distance / 2.0)
+        }
+        
+        let linearArea = linearLimit - (scaleDropPerStep * linearLimit * linearLimit / 2.0)
+        let tailDistance = distance - linearLimit
+        return linearArea + minScale * tailDistance
     }
     
     private func performStep(drift: Int) {
         guard !isAnimatingStep else { return }
         isAnimatingStep = true
         
-        let step = CGFloat(itemWidth + cardSpacing)
+        // Stop timer to prevent inconsistent overlaps or skipped beats
+        timer.upstream.connect().cancel()
         
-        withAnimation(.interpolatingSpring(stiffness: 300, damping: 30)) {
-            animatedShift = -CGFloat(drift) * step
+        let maxDelay = Double(4) * staggerDelay 
+        
+        for virtualIndex in currentIndex-4...currentIndex+4 {
+            let relativeIndex = virtualIndex - currentIndex
+            let delay = max(0, Double(relativeIndex + 2) * staggerDelay)
+            
+            withAnimation(.interpolatingSpring(stiffness: 300, damping: 32).delay(delay)) {
+                itemPositionShifts[virtualIndex] = -CGFloat(drift)
+            }
         }
         
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-            // Update currentIndex without wrapping to maintain ForEach stability
+        let totalTime = maxDelay + 0.7
+        
+        DispatchQueue.main.asyncAfter(deadline: .now() + totalTime) {
             currentIndex = currentIndex + drift
-            animatedShift = 0
+            itemPositionShifts.removeAll()
             isAnimatingStep = false
+            
+            // Restart timer only after animation has fully settled
+            // This ensures the 'rest' period is always exactly what the user selected
+            if isAutoScrollEnabled {
+                resetTimer(interval)
+            }
         }
     }
 }
@@ -559,8 +657,7 @@ struct CarouselCard: View {
         .overlay(
             Group {
                 if !isBackground {
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(.white.opacity(0.12), lineWidth: 1)
+                    // Removed border for a cleaner look
                 }
             }
         )
@@ -616,6 +713,7 @@ struct CarouselControls: View {
     @Binding var itemWidth: Double
     @Binding var itemHeight: Double
     @Binding var cardSpacing: Double
+    @Binding var staggerDelay: Double
     
     @State private var isExpanded: Bool = true
     
@@ -650,11 +748,12 @@ struct CarouselControls: View {
             
             if isExpanded {
                 VStack(spacing: 12) {
-                    ControlSlider(label: "Interval", value: $autoScrollInterval, range: 1...10)
+                    ControlSlider(label: "Interval", value: $autoScrollInterval, range: 0.1...10)
                     Divider().opacity(0.3)
                     ControlSlider(label: "Width", value: $itemWidth, range: 400...900)
-                    ControlSlider(label: "Height", value: $itemHeight, range: 300...750)
+                    ControlSlider(label: "Height", value: $itemHeight, range: 300...1000)
                     ControlSlider(label: "Gap", value: $cardSpacing, range: 10...500)
+                    ControlSlider(label: "Stagger", value: $staggerDelay, range: 0...0.2)
                 }
                 .transition(.asymmetric(
                     insertion: .opacity.combined(with: .offset(y: -10)),
@@ -683,9 +782,19 @@ struct ControlSlider: View {
                     .font(.system(size: 9, weight: .bold))
                     .foregroundColor(.secondary)
                 Spacer()
-                Text(label == "Interval" ? String(format: "%.1fs", value) : String(format: "%.0f", value))
-                    .font(.system(size: 9, design: .monospaced))
-                    .foregroundColor(.primary)
+                if label == "Interval" {
+                    Text(String(format: "%.1fs", value))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.primary)
+                } else if label == "Stagger" {
+                    Text(String(format: "%.2fs", value))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.primary)
+                } else {
+                    Text(String(format: "%.0f", value))
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(.primary)
+                }
             }
             Slider(value: $value, in: range)
                 .controlSize(.small)
