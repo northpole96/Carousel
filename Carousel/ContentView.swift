@@ -128,8 +128,18 @@ struct ContentView: View {
             }
         }
         .frame(minWidth: 1000, minHeight: 700)
-        .onChange(of: selectedItems) { _ in
-            loadLibraryPhotos()
+        .onChange(of: mediaItems) { items in
+            if !items.isEmpty {
+                showUI()
+            } else {
+                // Ensure cursor is unhidden if we back out
+                if isCursorHidden {
+                    NSCursor.unhide()
+                    isCursorHidden = false
+                }
+                hoverTask?.cancel()
+                isUIVisible = true
+            }
         }
         .onAppear {
             guard !didRestoreSavedAlbum else { return }
@@ -322,15 +332,31 @@ struct ContentView: View {
         }
         
         hoverTask?.cancel()
+        
+        // Auto-hide is only active when carousel is open (mediaItems not empty)
+        guard !mediaItems.isEmpty else { return }
+        
         hoverTask = Task {
             try? await Task.sleep(nanoseconds: 3_000_000_000) // 3 seconds
+            
             if !Task.isCancelled {
-                withAnimation(.easeInOut(duration: 1.0)) {
-                    isUIVisible = false
-                }
-                if !isCursorHidden {
-                    NSCursor.hide()
-                    isCursorHidden = true
+                // Check if we are in full screen
+                let isFullScreen = NSApp.windows.first(where: { $0.isVisible })?.styleMask.contains(.fullScreen) ?? false
+                
+                // Hide UI and Cursor only in Full Screen and Carousel view
+                if isFullScreen {
+                    withAnimation(.easeInOut(duration: 1.0)) {
+                        isUIVisible = false
+                    }
+                    if !isCursorHidden {
+                        NSCursor.hide()
+                        isCursorHidden = true
+                    }
+                } else {
+                    // In windowed mode, we might still want to hide the UI for a clean look, 
+                    // but the user specifically mentioned "when in full screen" for hiding.
+                    // To be safe and follow the request strictly, we'll only hide in full screen.
+                    // If you want UI to hide in windowed mode too, we can remove the check below.
                 }
             }
         }
